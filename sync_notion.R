@@ -7,53 +7,64 @@ if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
 invisible(lapply(need, library, character.only = TRUE))
 
 # --- config ---
-NOTION_TOKEN <- Sys.getenv("NOTION_TOKEN")
-DB_ID        <- Sys.getenv("NOTION_DATABASE_ID") # hyphenated UUID
-if (!nzchar(NOTION_TOKEN) || !nzchar(DB_ID)) stop("Set NOTION_TOKEN and NOTION_DATABASE_ID.")
+NOTION_TOKEN   <- Sys.getenv("NOTION_TOKEN")
+DB_ID          <- Sys.getenv("NOTION_DATABASE_ID") # hyphenated UUID
 LOOKBACK_HOURS <- as.integer(Sys.getenv("LOOKBACK_HOURS", "24"))
 NOTION_VERSION <- "2022-06-28"
 
-# --- helpers ---
-`%||%` <- function(x, y) if (is.null(x) || is.na(x) || x == "") y else x
-rtxt <- function(x) {
-  s <- as.character(x %||% "")
-  if (identical(s, "")) list()
-  else list(list(type="text", text=list(content=substr(s, 1, 1800))))
-}
-nnum  <- function(x) suppressWarnings(if (is.null(x) || is.na(x)) NULL else as.numeric(x))
-nbool <- function(x) isTRUE(x)
-ndate <- function(x) {
-  if (is.null(x) || is.na(x)) return(NULL)
-  list(start = format(as.POSIXct(x, tz = "UTC"), "%Y-%m-%dT%H:%M:%SZ"))
+if (!nzchar(NOTION_TOKEN) || !nzchar(DB_ID)) {
+  stop("Set NOTION_TOKEN and NOTION_DATABASE_ID.")
 }
 
-props_from_row <- function(r) {
-  list(
-    tweet_id         = list(title     = rtxt(r$tweet_id)),
-    tweet_url        = list(url       = r$tweet_url %||% NULL),
-    username         = list(rich_text = rtxt(r$username)),
-    user_id          = list(rich_text = rtxt(r$user_id)),
-    text             = list(rich_text = rtxt(r$text)),
-    reply_count      = list(number    = nnum(r$reply_count)),
-    retweet_count    = list(number    = nnum(r$retweet_count)),
-    like_count       = list(number    = nnum(r$like_count)),
-    quote_count      = list(number    = nnum(r$quote_count)),
-    bookmarked_count = list(number    = nnum(r$bookmarked_count)),
-    view_count       = list(number    = nnum(r$view_count)),  # handles integer64 -> double
-    date             = list(date      = ndate(r$date)),
-    is_quote         = list(checkbox  = nbool(r$is_quote)),
-    is_retweet       = list(checkbox  = nbool(r$is_retweet)),
-    engagement_rate  = list(number    = nnum(r$engagement_rate))
-  )
+# --- helpers ---
+`%||%` <- function(x, y) if (is.null(x) || is.na(x) || x == "") y else x
+
+rtxt <- function(x) {
+  s <- as.character(x %||% "")
+  if (identical(s, "")) list() else list(list(type = "text", text = list(content = substr(s, 1, 1800))))
+}
+
+# print Notion's real error body on 4xx/5xx
+perform <- function(req) {
+  tryCatch({
+    req_perform(req)
+  }, error = function(e) {
+    if (inherits(e, "httr2_http")) {
+      cat("\n--- Notion error", e$response$status_code, "---\n",
+          resp_body_string(e$response), "\n-----------------------------\n")
+    }
+    stop(e)
+  })
 }
 
 notion_req <- function(url) {
   request(url) |>
     req_headers(
-      Authorization   = paste("Bearer", NOTION_TOKEN),
-      "Notion-Version"= NOTION_VERSION,
-      "Content-Type"  = "application/json"
+      Authorization    = paste("Bearer", NOTION_TOKEN),
+      "Notion-Version" = NOTION_VERSION,
+      "Content-Type"   = "application/json"
     )
+}
+
+# Build properties that MATCH your current DB (tweet_id title, username text, user_id text, text text)
+props_from_row <- function(r) {
+  title_val <- as.character(r$tweet_id %||% "untitled")
+
+  list(
+    tweet_id = list( # <-- MUST be the Title prop in Notion
+      title = list(list(text = list(content = title_val)))
+    ),
+    username = list(
+      rich_text = rtxt(r$username)
+    ),
+    user_id = list(          # if your Notion 'user_id' is Number, change this line to:
+      rich_text = rtxt(r$user_id)
+      # user_id = list(number = suppressWarnings(as.numeric(r$user_id)))  # <— use this instead for Number
+    ),
+    text = list(
+      rich_text = rtxt(r$text)
+    )
+  )
 }
 
 find_page_by_tweet_id <- function(tweet_id) {
@@ -62,7 +73,8 @@ find_page_by_tweet_id <- function(tweet_id) {
     page_size = 1
   )
   resp <- notion_req(paste0("https://api.notion.com/v1/databases/", DB_ID, "/query")) |>
-    req_body_json(body) |> req_perform()
+    req_body_json(body, auto_unbox = TRUE) |>
+    perform()
   out <- resp_body_json(resp, simplifyVector = TRUE)
   if (length(out$results)) out$results$id[1] else NA_character_
 }
@@ -70,15 +82,16 @@ find_page_by_tweet_id <- function(tweet_id) {
 create_page <- function(pr) {
   body <- list(parent = list(database_id = DB_ID), properties = pr)
   resp <- notion_req("https://api.notion.com/v1/pages") |>
-    req_body_json(body) |> req_perform()
+    req_body_json(body, auto_unbox = TRUE) |>
+    perform()
   resp_body_json(resp, simplifyVector = TRUE)$id
 }
 
 update_page <- function(page_id, pr) {
   notion_req(paste0("https://api.notion.com/v1/pages/", page_id)) |>
     req_method("PATCH") |>
-    req_body_json(list(properties = pr)) |>
-    req_perform()
+    req_body_json(list(properties = pr), auto_unbox = TRUE) |>
+    perform()
   invisible(TRUE)
 }
 
@@ -106,7 +119,7 @@ con <- DBI::dbConnect(
   sslmode = "require"
 )
 
-since <- as.POSIXct(Sys.time(), tz = "UTC") - LOOKBACK_HOURS*3600
+since <- as.POSIXct(Sys.time(), tz = "UTC") - LOOKBACK_HOURS * 3600
 since_str <- format(since, "%Y-%m-%d %H:%M:%S%z")
 
 qry <- sprintf("
@@ -128,9 +141,9 @@ message(sprintf("Fetched %d rows since %s", nrow(rows), since_str))
 if (nrow(rows)) {
   for (i in seq_len(nrow(rows))) {
     r <- rows[i, , drop = FALSE]
-try({
-  upsert_row(r)
-}, silent = FALSE)
+    try({
+      upsert_row(r)
+    }, silent = FALSE)
     if (i %% 10 == 0) message(sprintf("Upserted %d/%d", i, nrow(rows)))
     Sys.sleep(0.35)  # ~3 rps limit
   }
