@@ -1,0 +1,50 @@
+name: Sync Supabase → Notion
+
+on:
+  schedule:
+    - cron: "15 * * * *"   # every hour at :15
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notion-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.3.3'
+          use-public-rspm: true
+
+      - name: Install system libraries (for RPostgres/curl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev libcurl4-openssl-dev libssl-dev
+
+      # If your script is in a subfolder, adjust the path below.
+      - name: Run Notion sync
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}   # hyphenated UUID
+          SUPABASE_HOST: ${{ secrets.SUPABASE_HOST }}
+          SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PWD:  ${{ secrets.SUPABASE_PWD }}
+          # Optional (your R script has defaults: DB=postgres, PORT=5432, LOOKBACK_HOURS=24)
+          SUPABASE_DB:   ${{ secrets.SUPABASE_DB }}
+          SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
+          LOOKBACK_HOURS: "24"
+        run: |
+          Rscript sync_notion.R
+          # If you named it without extension and made it executable:
+          # ./sync_notion
