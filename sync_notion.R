@@ -128,7 +128,9 @@ message(sprintf("Fetched %d rows since %s", nrow(rows), since_str))
 if (nrow(rows)) {
   for (i in seq_len(nrow(rows))) {
     r <- rows[i, , drop = FALSE]
-    try(upsert_row(r), silent = TRUE)
+try({
+  upsert_row(r)
+}, silent = FALSE)
     if (i %% 10 == 0) message(sprintf("Upserted %d/%d", i, nrow(rows)))
     Sys.sleep(0.35)  # ~3 rps limit
   }
@@ -136,3 +138,4 @@ if (nrow(rows)) {
 } else {
   message("Nothing to sync.")
 }
+
