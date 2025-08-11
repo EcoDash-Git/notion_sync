@@ -8,35 +8,56 @@ invisible(lapply(need, library, character.only = TRUE))
 
 # --- config ---
 NOTION_TOKEN   <- Sys.getenv("NOTION_TOKEN")
-DB_ID          <- Sys.getenv("NOTION_DATABASE_ID") # hyphenated UUID of the *database*
+DB_ID          <- Sys.getenv("NOTION_DATABASE_ID") # hyphenated UUID of the database
 LOOKBACK_HOURS <- as.integer(Sys.getenv("LOOKBACK_HOURS", "24"))
 NOTION_VERSION <- "2022-06-28"
-
 if (!nzchar(NOTION_TOKEN) || !nzchar(DB_ID)) stop("Set NOTION_TOKEN and NOTION_DATABASE_ID.")
 
 # --- helpers ---
 `%||%` <- function(x, y) if (is.null(x) || is.na(x) || x == "") y else x
 rtxt <- function(x) {
   s <- as.character(x %||% "")
-  if (identical(s, "")) list() else list(list(type = "text", text = list(content = substr(s, 1, 1800))))
+  if (identical(s, "")) list() else list(list(type="text", text=list(content=substr(s, 1, 1800))))
 }
 
-# perform() that NEVER throws; returns either the response or NULL with a rich error attribute
-perform <- function(req, tag = "") {
-  tryCatch({
-    req_perform(req)
-  }, error = function(e) {
-    err <- list(tag = tag, status = NA_integer_, body = paste("R error:", conditionMessage(e)))
-    if (inherits(e, "httr2_http") && !is.null(e$response)) {
-      err$status <- e$response$status_code
-      err$body   <- tryCatch(resp_body_string(e$response), error = function(...) "<no body>")
-    }
-    structure(NULL, err = err)
-  })
+# robust datetime coercion (returns POSIXct(NA) if it can’t parse)
+parse_dt <- function(x) {
+  if (inherits(x, "POSIXt")) return(as.POSIXct(x, tz="UTC"))
+  if (inherits(x, "Date"))   return(as.POSIXct(x, tz="UTC"))
+  if (is.numeric(x))         return(as.POSIXct(x, origin="1970-01-01", tz="UTC"))
+  if (!is.character(x))      return(as.POSIXct(NA, origin="1970-01-01", tz="UTC"))
+  xx <- trimws(x)
+
+  fmt_try <- function(fmt) suppressWarnings(as.POSIXct(xx, format=fmt, tz="UTC"))
+  cand <- list(
+    fmt_try("%Y-%m-%dT%H:%M:%OSZ"),
+    fmt_try("%Y-%m-%d %H:%M:%S%z"),
+    fmt_try("%Y-%m-%d %H:%M:%S %z"),
+    fmt_try("%Y-%m-%d %H:%M:%S"),
+    fmt_try("%Y-%m-%d")
+  )
+  out <- cand[[which.max(!is.na(cand))]]
+  if (length(out) == 0) as.POSIXct(NA, origin="1970-01-01", tz="UTC") else out
 }
-is_err <- function(x) is.null(x) && !is.null(attr(x, "err"))
+
+# perform() that never throws; returns either the response or a small error object
+perform <- function(req, tag="") {
+  tryCatch(
+    req_perform(req),
+    error = function(e) {
+      err <- list(tag = tag, status = NA_integer_, body = paste("R error:", conditionMessage(e)))
+      if (inherits(e, "httr2_http") && !is.null(e$response)) {
+        err$status <- e$response$status_code
+        err$body   <- tryCatch(resp_body_string(e$response), error = function(...) "<no body>")
+      }
+      structure(list(.err = TRUE, err = err), class = "notion_err")
+    }
+  )
+}
+is_err  <- function(x) inherits(x, "notion_err") && isTRUE(x$.err)
 show_err <- function(x, row_i = NA, tweet_id = NA) {
-  er <- attr(x, "err")
+  if (!is_err(x)) return(invisible())
+  er <- x$err
   cat(sprintf("⚠️ Notion error%s%s [%s] Status: %s\nBody: %s\n",
               if (!is.na(row_i)) paste0(" on row ", row_i) else "",
               if (!is.na(tweet_id)) paste0(" (tweet_id=", tweet_id, ")") else "",
@@ -56,10 +77,10 @@ notion_req <- function(url) {
 
 # --- read DB schema & detect the Title property name ---
 get_db_schema <- function() {
-  resp <- notion_req(paste0("https://api.notion.com/v1/databases/", DB_ID)) |> perform(tag = "GET /databases")
+  resp <- notion_req(paste0("https://api.notion.com/v1/databases/", DB_ID)) |> perform(tag="GET /databases")
   if (is_err(resp)) {
     show_err(resp)
-    stop("Could not read Notion database schema (check token, DB_ID, and that the integration is shared to this database).")
+    stop("Could not read Notion database schema (check token, DB_ID, and share the database with the integration).")
   }
   resp_body_json(resp, simplifyVector = FALSE)
 }
@@ -67,7 +88,7 @@ get_db_schema <- function() {
 .DB <- get_db_schema()
 PROPS <- .DB$properties
 TITLE_PROP <- names(Filter(function(p) identical(p$type, "title"), PROPS))[1]
-if (is.null(TITLE_PROP)) stop("This Notion database has no Title property (Name).")
+if (is.null(TITLE_PROP)) stop("This Notion database has no Title (Name) property.")
 
 # Build a property payload that ONLY includes columns that exist in Notion
 set_prop <- function(name, value) {
@@ -75,21 +96,19 @@ set_prop <- function(name, value) {
   if (is.null(p)) return(NULL)
   tp <- p$type
   if (tp == "title") {
-    list(title = list(list(type="text", text=list(content = as.character(value %||% "untitled")))))
+    list(title = list(list(type="text", text=list(content=as.character(value %||% "untitled")))))
   } else if (tp == "rich_text") {
     list(rich_text = rtxt(value))
   } else if (tp == "number") {
     v <- suppressWarnings(as.numeric(value))
-    if (!is.finite(v)) return(NULL)  # skip impossible numbers
+    if (!is.finite(v)) return(NULL)
     list(number = v)
   } else if (tp == "url") {
     list(url = as.character(value %||% NULL))
   } else if (tp == "date") {
-    if (is.null(value) || is.na(value)) {
-      list(date = NULL)
-    } else {
-      list(date = list(start = format(as.POSIXct(value, tz="UTC"), "%Y-%m-%dT%H:%M:%SZ")))
-    }
+    d <- parse_dt(value)
+    if (is.na(d)) return(NULL)
+    list(date = list(start = format(d, "%Y-%m-%dT%H:%M:%SZ")))
   } else if (tp == "checkbox") {
     list(checkbox = isTRUE(value))
   } else {
@@ -99,12 +118,11 @@ set_prop <- function(name, value) {
 
 props_from_row <- function(r) {
   pr <- list()
-  # Title: prefer tweet_id text; fall back to tweet text
+  # Title: prefer tweet_id; fall back to tweet text
   title_val <- r$tweet_id %||% r$text %||% "untitled"
   pr[[TITLE_PROP]] <- set_prop(TITLE_PROP, title_val)
 
-  # Optional extras – only if column exists in Notion
-  # NOTE: We deliberately skip 'tweet_id' here to avoid number/precision pitfalls; it's stored in the Title.
+  # Optional extras – only if the column exists in Notion
   for (nm in c("username","user_id","text","tweet_url","reply_count",
                "retweet_count","like_count","quote_count","bookmarked_count",
                "view_count","date","is_quote","is_retweet","engagement_rate")) {
@@ -120,8 +138,8 @@ find_page_by_title_eq <- function(val) {
                page_size = 1)
   resp <- notion_req(paste0("https://api.notion.com/v1/databases/", DB_ID, "/query")) |>
     req_body_json(body, auto_unbox = TRUE) |>
-    perform(tag = "POST /databases/query")
-  if (is_err(resp)) return(structure(NA_character_, err = attr(resp, "err")))
+    perform(tag="POST /databases/query")
+  if (is_err(resp)) return(structure(NA_character_, class="notion_err", .err=TRUE, err=resp$err))
   out <- resp_body_json(resp, simplifyVector = TRUE)
   if (length(out$results)) out$results$id[1] else NA_character_
 }
@@ -130,8 +148,8 @@ create_page <- function(pr) {
   body <- list(parent = list(database_id = DB_ID), properties = pr)
   resp <- notion_req("https://api.notion.com/v1/pages") |>
     req_body_json(body, auto_unbox = TRUE) |>
-    perform(tag = "POST /pages")
-  if (is_err(resp)) return(structure(NA_character_, err = attr(resp, "err")))
+    perform(tag="POST /pages")
+  if (is_err(resp)) return(structure(NA_character_, class="notion_err", .err=TRUE, err=resp$err))
   resp_body_json(resp, simplifyVector = TRUE)$id
 }
 
@@ -139,45 +157,38 @@ update_page <- function(page_id, pr) {
   resp <- notion_req(paste0("https://api.notion.com/v1/pages/", page_id)) |>
     req_method("PATCH") |>
     req_body_json(list(properties = pr), auto_unbox = TRUE) |>
-    perform(tag = "PATCH /pages/:id")
-  if (is_err(resp)) return(structure(FALSE, err = attr(resp, "err")))
+    perform(tag="PATCH /pages/:id")
+  if (is_err(resp)) return(structure(FALSE, class="notion_err", .err=TRUE, err=resp$err))
   TRUE
 }
 
 # Try full upsert; on create failure, try minimal (Title-only) then patch
-upsert_row <- function(r, i) {
+upsert_row <- function(r) {
   title_val <- r$tweet_id %||% r$text %||% "untitled"
   pr_full   <- props_from_row(r)
 
   pid <- find_page_by_title_eq(title_val)
   if (!is.na(pid[1])) {
     ok <- update_page(pid, pr_full)
-    if (is.logical(ok) && ok) return(list(ok=TRUE))
-    return(list(ok=FALSE, err=attr(ok, "err")))
+    return(is.logical(ok) && ok)
   }
 
-  # create
   pid2 <- create_page(pr_full)
-  if (!is.na(pid2[1])) return(list(ok=TRUE))
+  if (!is.na(pid2[1])) return(TRUE)
 
-  # fallback: minimal title then patch
-  pr_min <- list()
-  pr_min[[TITLE_PROP]] <- set_prop(TITLE_PROP, title_val)
+  pr_min <- list(); pr_min[[TITLE_PROP]] <- set_prop(TITLE_PROP, title_val)
   pid3 <- create_page(pr_min)
-  if (is.na(pid3[1])) return(list(ok=FALSE, err=attr(pid2, "err")))  # report first create error
+  if (is.na(pid3[1])) return(FALSE)
 
   ok2 <- update_page(pid3, pr_full)
-  if (is.logical(ok2) && ok2) return(list(ok=TRUE))
-  list(ok=FALSE, err=attr(ok2, "err"))
+  is.logical(ok2) && ok2
 }
 
 # --- Supabase (Postgres) ---
 supa_host <- Sys.getenv("SUPABASE_HOST")
 supa_user <- Sys.getenv("SUPABASE_USER")
 supa_pwd  <- Sys.getenv("SUPABASE_PWD")
-if (!nzchar(supa_host) || !nzchar(supa_user) || !nzchar(supa_pwd)) {
-  stop("Set SUPABASE_HOST, SUPABASE_USER, SUPABASE_PWD.")
-}
+if (!nzchar(supa_host) || !nzchar(supa_user) || !nzchar(supa_pwd)) stop("Set SUPABASE_HOST, SUPABASE_USER, SUPABASE_PWD.")
 
 con <- DBI::dbConnect(
   RPostgres::Postgres(),
@@ -207,22 +218,20 @@ DBI::dbDisconnect(con)
 
 message(sprintf("Fetched %d rows since %s", nrow(rows), since_str))
 
-# --- SMOKE TEST: can we write a trivial row? ---
+# --- SMOKE TEST: can we write & archive a trivial page? ---
 smoke_title <- paste0("ping ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"))
 smoke_pid <- create_page(setNames(list(set_prop(TITLE_PROP, smoke_title)), TITLE_PROP))
-if (is.na(smoke_pid[1])) {
+if (is_err(smoke_pid) || is.na(smoke_pid[1])) {
   cat("\n🔥 Smoke test FAILED — cannot create even a minimal page in this database.\n",
-      "Please confirm: the integration is connected to THIS database (not just the page), ",
-      "and has insert/update permissions. Also re-check NOTION_DATABASE_ID.\n", sep = "")
-  # also print the detailed error:
-  show_err(smoke_pid)
+      "Confirm the integration is connected to THIS database and has insert/update permissions.\n", sep = "")
+  if (is_err(smoke_pid)) show_err(smoke_pid)
   quit(status = 1L, save = "no")
 } else {
-  # tidy up: delete the ping page (soft delete)
-  notion_req(paste0("https://api.notion.com/v1/blocks/", smoke_pid)) |>
+  # archive the ping page correctly via pages endpoint
+  notion_req(paste0("https://api.notion.com/v1/pages/", smoke_pid)) |>
     req_method("PATCH") |>
     req_body_json(list(archived = TRUE), auto_unbox = TRUE) |>
-    perform(tag = "ARCHIVE ping")
+    perform(tag="ARCHIVE ping")
 }
 
 # --- Upsert into Notion ---
@@ -230,18 +239,21 @@ success <- 0L
 if (nrow(rows)) {
   for (i in seq_len(nrow(rows))) {
     r  <- rows[i, , drop = FALSE]
-    res <- upsert_row(r, i)
-    if (isTRUE(res$ok)) {
-      success <- success + 1L
-    } else {
-      show_err(structure(NULL, err = res$err %||% list(tag="unknown",status=NA,body="<no details>")),
-               row_i = i, tweet_id = r$tweet_id)
+    ok <- FALSE
+    # Guard: if 'date' is unparseable, drop it for this row
+    if (!is.null(r$date)) {
+      d <- parse_dt(r$date)
+      if (is.na(d)) r$date <- NULL else r$date <- d
     }
+    try(ok <- upsert_row(r), silent = TRUE)
+    if (ok) success <- success + 1L else message(sprintf("Row %d failed (tweet_id=%s)", i, as.character(r$tweet_id)))
     if (i %% 10 == 0) message(sprintf("Processed %d/%d (success %d)", i, nrow(rows), success))
-    Sys.sleep(0.35)  # ~3 rps limit
+    Sys.sleep(0.35)  # stay under Notion's ~3 rps
   }
   message(sprintf("Done. %d/%d succeeded.", success, nrow(rows)))
 } else {
   message("Nothing to sync.")
 }
+
+
 
