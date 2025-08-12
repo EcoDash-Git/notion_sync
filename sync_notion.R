@@ -11,6 +11,12 @@ NOTION_TOKEN   <- Sys.getenv("NOTION_TOKEN")
 DB_ID          <- Sys.getenv("NOTION_DATABASE_ID") # hyphenated UUID of the database
 LOOKBACK_HOURS <- as.integer(Sys.getenv("LOOKBACK_HOURS", "24"))
 NOTION_VERSION <- "2022-06-28"
+# Optional knobs (via env or edit here)
+NUM_NA_AS_ZERO <- tolower(Sys.getenv("NUM_NA_AS_ZERO","false")) %in% c("1","true","yes")
+INSPECT_FIRST_ROW <- tolower(Sys.getenv("INSPECT_FIRST_ROW","false")) %in% c("1","true","yes")
+DUMP_SCHEMA       <- tolower(Sys.getenv("DUMP_SCHEMA","false"))       %in% c("1","true","yes")
+RATE_DELAY_SEC    <- as.numeric(Sys.getenv("RATE_DELAY_SEC","0.35"))
+
 if (!nzchar(NOTION_TOKEN) || !nzchar(DB_ID)) stop("Set NOTION_TOKEN and NOTION_DATABASE_ID.")
 
 # --- helpers ---
@@ -24,23 +30,23 @@ rtxt <- function(x) {
 parse_dt <- function(x) {
   if (inherits(x, "POSIXt")) return(as.POSIXct(x, tz="UTC"))
   if (inherits(x, "Date"))   return(as.POSIXct(x, tz="UTC"))
+  if (inherits(x, "integer64")) x <- as.character(x)
   if (is.numeric(x))         return(as.POSIXct(x, origin="1970-01-01", tz="UTC"))
   if (!is.character(x))      return(as.POSIXct(NA, origin="1970-01-01", tz="UTC"))
   xx <- trimws(x)
-
-  fmt_try <- function(fmt) suppressWarnings(as.POSIXct(xx, format=fmt, tz="UTC"))
-  cand <- list(
-    fmt_try("%Y-%m-%dT%H:%M:%OSZ"),
-    fmt_try("%Y-%m-%d %H:%M:%S%z"),
-    fmt_try("%Y-%m-%d %H:%M:%S %z"),
-    fmt_try("%Y-%m-%d %H:%M:%S"),
-    fmt_try("%Y-%m-%d")
-  )
-  out <- cand[[which.max(!is.na(cand))]]
-  if (length(out) == 0) as.POSIXct(NA, origin="1970-01-01", tz="UTC") else out
+  fmts <- c("%Y-%m-%dT%H:%M:%OSZ",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y-%m-%d %H:%M:%S %z",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d")
+  for (f in fmts) {
+    d <- suppressWarnings(as.POSIXct(xx, format=f, tz="UTC"))
+    if (!is.na(d)) return(d)
+  }
+  as.POSIXct(NA, origin="1970-01-01", tz="UTC")
 }
 
-# perform() that never throws; returns either the response or a small error object
+# perform() that never throws; returns response or small error object
 perform <- function(req, tag="") {
   tryCatch(
     req_perform(req),
@@ -90,6 +96,28 @@ PROPS <- .DB$properties
 TITLE_PROP <- names(Filter(function(p) identical(p$type, "title"), PROPS))[1]
 if (is.null(TITLE_PROP)) stop("This Notion database has no Title (Name) property.")
 
+if (DUMP_SCHEMA) {
+  cat("\n--- Notion schema ---\n")
+  cat(paste(
+    vapply(names(PROPS), function(n) sprintf("%s : %s", n, PROPS[[n]]$type), character(1)),
+    collapse = "\n"
+  ), "\n----------------------\n")
+}
+
+# coercers for number/checkbox robustness
+to_bool <- function(x) {
+  if (is.logical(x)) return(isTRUE(x))
+  if (is.numeric(x)) return(is.finite(x) && x != 0)
+  if (is.character(x)) return(tolower(trimws(x)) %in% c("true","t","yes","1"))
+  FALSE
+}
+to_num <- function(x) {
+  if (inherits(x, "integer64")) x <- as.character(x)
+  v <- suppressWarnings(as.numeric(x))
+  if (is.na(v) && NUM_NA_AS_ZERO) v <- 0
+  v
+}
+
 # Build a property payload that ONLY includes columns that exist in Notion
 set_prop <- function(name, value) {
   p <- PROPS[[name]]
@@ -100,17 +128,19 @@ set_prop <- function(name, value) {
   } else if (tp == "rich_text") {
     list(rich_text = rtxt(value))
   } else if (tp == "number") {
-    v <- suppressWarnings(as.numeric(value))
+    v <- to_num(value)
     if (!is.finite(v)) return(NULL)
     list(number = v)
   } else if (tp == "url") {
-    list(url = as.character(value %||% NULL))
+    u <- as.character(value %||% "")
+    if (!nzchar(u)) return(list(url = NULL))
+    list(url = u)
   } else if (tp == "date") {
     d <- parse_dt(value)
     if (is.na(d)) return(NULL)
     list(date = list(start = format(d, "%Y-%m-%dT%H:%M:%SZ")))
   } else if (tp == "checkbox") {
-    list(checkbox = isTRUE(value))
+    list(checkbox = to_bool(value))
   } else {
     NULL
   }
@@ -131,6 +161,24 @@ props_from_row <- function(r) {
     }
   }
   pr
+}
+
+# Inspector: prints mapping decisions for a single row
+explain_props <- function(r) {
+  wanted <- c("username","user_id","text","tweet_url","reply_count",
+              "retweet_count","like_count","quote_count","bookmarked_count",
+              "view_count","date","is_quote","is_retweet","engagement_rate")
+  cat("\n--- Property mapping (one row) ---\n")
+  for (nm in wanted) {
+    exists <- !is.null(PROPS[[nm]])
+    tp <- if (exists) PROPS[[nm]]$type else "<missing>"
+    val <- r[[nm]]
+    payload <- if (exists) set_prop(nm, val) else NULL
+    cat(sprintf("%-17s | notion=%-9s | R=%-10s | value=%s | %s\n",
+      nm, tp, paste(class(val), collapse="+"),
+      if (length(val)) paste0(utils::head(as.character(val),1)) else "<NULL>",
+      if (is.null(payload)) "SKIPPED" else "OK"))
+  }
 }
 
 find_page_by_title_eq <- function(val) {
@@ -227,12 +275,14 @@ if (is_err(smoke_pid) || is.na(smoke_pid[1])) {
   if (is_err(smoke_pid)) show_err(smoke_pid)
   quit(status = 1L, save = "no")
 } else {
-  # archive the ping page correctly via pages endpoint
   notion_req(paste0("https://api.notion.com/v1/pages/", smoke_pid)) |>
     req_method("PATCH") |>
     req_body_json(list(archived = TRUE), auto_unbox = TRUE) |>
     perform(tag="ARCHIVE ping")
 }
+
+# Optional one-row inspector (helps find the columns that stay blank)
+if (INSPECT_FIRST_ROW && nrow(rows)) explain_props(rows[1, , drop = FALSE])
 
 # --- Upsert into Notion ---
 success <- 0L
@@ -248,12 +298,13 @@ if (nrow(rows)) {
     try(ok <- upsert_row(r), silent = TRUE)
     if (ok) success <- success + 1L else message(sprintf("Row %d failed (tweet_id=%s)", i, as.character(r$tweet_id)))
     if (i %% 10 == 0) message(sprintf("Processed %d/%d (success %d)", i, nrow(rows), success))
-    Sys.sleep(0.35)  # stay under Notion's ~3 rps
+    Sys.sleep(RATE_DELAY_SEC)  # stay under Notion’s ~3 rps
   }
   message(sprintf("Done. %d/%d succeeded.", success, nrow(rows)))
 } else {
   message("Nothing to sync.")
 }
+
 
 
 
