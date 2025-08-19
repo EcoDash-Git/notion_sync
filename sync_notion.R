@@ -9,7 +9,7 @@ invisible(lapply(need, library, character.only = TRUE))
 # --- config ---
 NOTION_TOKEN   <- Sys.getenv("NOTION_TOKEN")
 DB_ID          <- Sys.getenv("NOTION_DATABASE_ID") # hyphenated UUID of the database
-LOOKBACK_HOURS <- as.integer(Sys.getenv("LOOKBACK_HOURS", "24"))
+LOOKBACK_HOURS <- as.integer(Sys.getenv("LOOKBACK_HOURS", "17532"))
 NOTION_VERSION <- "2022-06-28"
 # Optional knobs (via env or edit here)
 NUM_NA_AS_ZERO <- tolower(Sys.getenv("NUM_NA_AS_ZERO","false")) %in% c("1","true","yes")
@@ -304,6 +304,7 @@ if (nrow(rows)) {
 } else {
   message("Nothing to sync.")
 }
+
 
 
 
