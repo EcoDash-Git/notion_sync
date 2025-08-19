@@ -9,7 +9,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120   # was 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
