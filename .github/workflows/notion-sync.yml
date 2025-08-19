@@ -2,22 +2,14 @@ name: Sync Supabase → Notion
 
 on:
   schedule:
-    - cron: "0 15 * * *"   # 11:00 AM in New York during EDT (UTC-4)
-    - cron: "0 16 * * *"   # 11:00 AM in New York during EST (UTC-5)
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: notion-sync
-  cancel-in-progress: false
+    - cron: "0 15 * * *"   # 11:00 in New York during EDT (UTC-4)
+    - cron: "0 16 * * *"   # 11:00 in New York during EST (UTC-5)
+  workflow_dispatch: {}
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,23 +25,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libpq-dev libcurl4-openssl-dev libssl-dev
 
-      - name: Run Notion sync (only at 11:00 AM New York)
+      # Get current hour in New York and expose it as an output
+      - id: nytime
+        name: Get New York hour
+        run: echo "hour=$(TZ=America/New_York date +%H)" >> $GITHUB_OUTPUT
+
+      - name: Run Notion sync
+        if: ${{ github.event_name != 'schedule' || steps.nytime.outputs.hour == '11' }}
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}   # hyphenated UUID
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           SUPABASE_HOST: ${{ secrets.SUPABASE_HOST }}
           SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
           SUPABASE_PWD:  ${{ secrets.SUPABASE_PWD }}
           SUPABASE_DB:   ${{ secrets.SUPABASE_DB }}
           SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
           LOOKBACK_HOURS: "17532"
-        run: |
-          # Guard so we only run at 11:00 in New York (works across DST)
-          if [ "$(TZ=America/New_York date +%H)" != "11" ]; then
-            echo "Not 11:00 AM in New York — skipping."
-            exit 0
-          fi
-
-          Rscript sync_notion.R
-          # If you named it without extension and made it executable:
-          # ./sync_notion
+        run: Rscript sync_notion.R
