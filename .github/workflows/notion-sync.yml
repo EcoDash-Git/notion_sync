@@ -42,7 +42,7 @@ jobs:
           SUPABASE_PWD:  ${{ secrets.SUPABASE_PWD }}
           SUPABASE_DB:   ${{ secrets.SUPABASE_DB }}
           SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
-          LOOKBACK_HOURS: "24"
+          LOOKBACK_HOURS: "17532"
         run: |
           # Guard so we only run at 11:00 in New York (works across DST)
           if [ "$(TZ=America/New_York date +%H)" != "11" ]; then
