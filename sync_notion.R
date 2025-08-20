@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sync Supabase (Postgres) → Notion database (paged, with retries & preindex)
+# Supabase (Postgres) → Notion (paged, lazy preindex, SQL de-dupe)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # --- packages ----------------------------------------------------------------
@@ -12,21 +12,21 @@ invisible(lapply(need, library, character.only = TRUE))
 
 # --- config ------------------------------------------------------------------
 NOTION_TOKEN     <- Sys.getenv("NOTION_TOKEN")
-DB_ID            <- Sys.getenv("NOTION_DATABASE_ID")  # hyphenated UUID
-LOOKBACK_HOURS   <- as.integer(Sys.getenv("LOOKBACK_HOURS", "17532")) # ~2y
+DB_ID            <- Sys.getenv("NOTION_DATABASE_ID")
+LOOKBACK_HOURS   <- as.integer(Sys.getenv("LOOKBACK_HOURS", "17532")) # ~2 years
 NOTION_VERSION   <- "2022-06-28"
 
-# Optional knobs (via env or edit here)
-NUM_NA_AS_ZERO     <- tolower(Sys.getenv("NUM_NA_AS_ZERO","false")) %in% c("1","true","yes")
-INSPECT_FIRST_ROW  <- tolower(Sys.getenv("INSPECT_FIRST_ROW","false")) %in% c("1","true","yes")
-DUMP_SCHEMA        <- tolower(Sys.getenv("DUMP_SCHEMA","false"))       %in% c("1","true","yes")
-RATE_DELAY_SEC     <- as.numeric(Sys.getenv("RATE_DELAY_SEC","0.2"))   # was 0.35
-IMPORT_ALL         <- tolower(Sys.getenv("IMPORT_ALL","false"))        %in% c("1","true","yes")
-RUN_SMOKE_TEST     <- tolower(Sys.getenv("RUN_SMOKE_TEST","false"))    %in% c("1","true","yes")
-CHUNK_SIZE         <- as.integer(Sys.getenv("CHUNK_SIZE","800"))       # rows per page
-CHUNK_OFFSET       <- as.integer(Sys.getenv("CHUNK_OFFSET","0"))       # starting offset
-USERNAME_FILTER    <- Sys.getenv("USERNAME_FILTER","")                 # e.g. "HyMatrixOrg"
-ORDER_DIR          <- toupper(Sys.getenv("ORDER_DIR","DESC"))          # newest-first
+NUM_NA_AS_ZERO   <- tolower(Sys.getenv("NUM_NA_AS_ZERO","false")) %in% c("1","true","yes")
+INSPECT_FIRST_ROW<- tolower(Sys.getenv("INSPECT_FIRST_ROW","false")) %in% c("1","true","yes")
+DUMP_SCHEMA      <- tolower(Sys.getenv("DUMP_SCHEMA","false"))       %in% c("1","true","yes")
+RATE_DELAY_SEC   <- as.numeric(Sys.getenv("RATE_DELAY_SEC","0.2"))
+IMPORT_ALL       <- tolower(Sys.getenv("IMPORT_ALL","false"))        %in% c("1","true","yes")
+RUN_SMOKE_TEST   <- tolower(Sys.getenv("RUN_SMOKE_TEST","false"))    %in% c("1","true","yes")
+
+CHUNK_SIZE       <- as.integer(Sys.getenv("CHUNK_SIZE","800"))
+CHUNK_OFFSET     <- as.integer(Sys.getenv("CHUNK_OFFSET","0"))
+USERNAME_FILTER  <- Sys.getenv("USERNAME_FILTER","")                 # e.g. "HyMatrixOrg"
+ORDER_DIR        <- toupper(Sys.getenv("ORDER_DIR","DESC"))
 if (!(ORDER_DIR %in% c("ASC","DESC"))) ORDER_DIR <- "DESC"
 
 if (!nzchar(NOTION_TOKEN) || !nzchar(DB_ID)) stop("Set NOTION_TOKEN and NOTION_DATABASE_ID.")
@@ -34,14 +34,12 @@ if (!nzchar(NOTION_TOKEN) || !nzchar(DB_ID)) stop("Set NOTION_TOKEN and NOTION_D
 # --- helpers -----------------------------------------------------------------
 `%||%` <- function(x, y) if (is.null(x) || is.na(x) || x == "") y else x
 
-# Rich text builder (trim to ~1800 chars); returns empty list for empty text
 rtxt <- function(x) {
   s <- as.character(x %||% "")
   if (identical(s, "")) list()
   else list(list(type="text", text=list(content=substr(s, 1, 1800))))
 }
 
-# robust datetime coercion (returns POSIXct(NA) if it can’t parse)
 parse_dt <- function(x) {
   if (inherits(x, "POSIXt")) return(as.POSIXct(x, tz="UTC"))
   if (inherits(x, "Date"))   return(as.POSIXct(x, tz="UTC"))
@@ -49,11 +47,7 @@ parse_dt <- function(x) {
   if (is.numeric(x))         return(as.POSIXct(x, origin="1970-01-01", tz="UTC"))
   if (!is.character(x))      return(as.POSIXct(NA, origin="1970-01-01", tz="UTC"))
   xx <- trimws(x)
-  fmts <- c("%Y-%m-%dT%H:%M:%OSZ",
-            "%Y-%m-%d %H:%M:%S%z",
-            "%Y-%m-%d %H:%M:%S %z",
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d")
+  fmts <- c("%Y-%m-%dT%H:%M:%OSZ","%Y-%m-%d %H:%M:%S%z","%Y-%m-%d %H:%M:%S %z","%Y-%m-%d %H:%M:%S","%Y-%m-%d")
   for (f in fmts) {
     d <- suppressWarnings(as.POSIXct(xx, format=f, tz="UTC"))
     if (!is.na(d)) return(d)
@@ -61,7 +55,6 @@ parse_dt <- function(x) {
   as.POSIXct(NA, origin="1970-01-01", tz="UTC")
 }
 
-# perform() with retry/backoff (handles 429/5xx and network glitches)
 perform <- function(req, tag = "", max_tries = 6, base_sleep = 0.5) {
   last <- NULL
   for (i in seq_len(max_tries)) {
@@ -106,21 +99,16 @@ notion_req <- function(url) {
     )
 }
 
-# --- read DB schema & detect the Title property name -------------------------
+# --- Notion schema -----------------------------------------------------------
 get_db_schema <- function() {
   resp <- notion_req(paste0("https://api.notion.com/v1/databases/", DB_ID)) |> perform(tag="GET /databases")
-  if (is_err(resp)) {
-    show_err(resp)
-    stop("Could not read Notion database schema (check token, DB_ID, and share the database with the integration).")
-  }
+  if (is_err(resp)) { show_err(resp); stop("Could not read Notion database schema.") }
   resp_body_json(resp, simplifyVector = FALSE)
 }
-
 .DB <- get_db_schema()
 PROPS <- .DB$properties
 TITLE_PROP <- names(Filter(function(p) identical(p$type, "title"), PROPS))[1]
 if (is.null(TITLE_PROP)) stop("This Notion database has no Title (Name) property.")
-
 if (DUMP_SCHEMA) {
   cat("\n--- Notion schema ---\n")
   cat(paste(
@@ -129,7 +117,6 @@ if (DUMP_SCHEMA) {
   ), "\n----------------------\n")
 }
 
-# coercers for number/checkbox robustness
 to_bool <- function(x) {
   if (is.logical(x)) return(isTRUE(x))
   if (is.numeric(x)) return(is.finite(x) && x != 0)
@@ -143,10 +130,8 @@ to_num <- function(x) {
   v
 }
 
-# Build a property payload that ONLY includes columns that exist in Notion
 set_prop <- function(name, value) {
-  p <- PROPS[[name]]
-  if (is.null(p)) return(NULL)
+  p <- PROPS[[name]]; if (is.null(p)) return(NULL)
   tp <- p$type
   if (tp == "title") {
     list(title = list(list(type="text", text=list(content=as.character(value %||% "untitled")))))
@@ -163,43 +148,28 @@ set_prop <- function(name, value) {
     list(date = list(start = format(d, "%Y-%m-%dT%H:%M:%SZ")))
   } else if (tp == "checkbox") {
     list(checkbox = to_bool(value))
-  } else {
-    NULL
-  }
+  } else NULL
 }
 
 props_from_row <- function(r) {
   pr <- list()
-  title_val <- paste0(r$username %||% "", " • ", r$tweet_id %||% r$text %||% "untitled")
-  pr[[TITLE_PROP]] <- set_prop(TITLE_PROP, title_val)
+  # Prefer a stable title: tweet_id if present, else username • text
+  ttl <- if (nzchar(as.character(r$tweet_id %||% ""))) {
+    as.character(r$tweet_id)
+  } else {
+    paste0(r$username %||% "", " • ", r$text %||% "untitled")
+  }
+  pr[[TITLE_PROP]] <- set_prop(TITLE_PROP, ttl)
 
   for (nm in c("username","user_id","text","tweet_url","reply_count",
                "retweet_count","like_count","quote_count","bookmarked_count",
                "view_count","date","is_quote","is_retweet","engagement_rate","tweet_id")) {
-    if (!is.null(PROPS[[nm]]) && !is.null(r[[nm]])) {
-      pr[[nm]] <- set_prop(nm, r[[nm]])
-    }
+    if (!is.null(PROPS[[nm]]) && !is.null(r[[nm]])) pr[[nm]] <- set_prop(nm, r[[nm]])
   }
   pr
 }
 
-explain_props <- function(r) {
-  wanted <- c("username","user_id","text","tweet_url","reply_count",
-              "retweet_count","like_count","quote_count","bookmarked_count",
-              "view_count","date","is_quote","is_retweet","engagement_rate","tweet_id")
-  cat("\n--- Property mapping (one row) ---\n")
-  for (nm in wanted) {
-    exists <- !is.null(PROPS[[nm]])
-    tp <- if (exists) PROPS[[nm]]$type else "<missing>"
-    val <- r[[nm]]
-    payload <- if (exists) set_prop(nm, val) else NULL
-    cat(sprintf("%-17s | notion=%-9s | R=%-10s | value=%s | %s\n",
-      nm, tp, paste(class(val), collapse="+"),
-      if (length(val)) paste0(utils::head(as.character(val),1)) else "<NULL>",
-      if (is.null(payload)) "SKIPPED" else "OK"))
-  }
-}
-
+# Fallback if we must query by title (rare)
 find_page_by_title_eq <- function(val) {
   body <- list(filter = list(property = TITLE_PROP, title = list(equals = as.character(val %||% ""))),
                page_size = 1)
@@ -211,54 +181,89 @@ find_page_by_title_eq <- function(val) {
   if (length(out$results)) out$results$id[1] else NA_character_
 }
 
-# --- A) PRE-INDEX: title, tweet_id, tweet_url
-fetch_notion_index <- function() {
-  url <- paste0("https://api.notion.com/v1/databases/", DB_ID, "/query")
-  cursor <- NULL
-  by_title <- new.env(parent = emptyenv())
-  by_tid   <- new.env(parent = emptyenv())
-  by_url   <- new.env(parent = emptyenv())
-  n <- 0L
+# --- A) LAZY index for only the rows in this page ----------------------------
+# Builds maps: by_url, by_tid, by_title (for fallback)
+build_index_for_rows <- function(rows) {
+  by_url <- new.env(parent=emptyenv())
+  by_tid <- new.env(parent=emptyenv())
+  by_ttl <- new.env(parent=emptyenv())
 
-  repeat {
-    body <- list(page_size = 100)
-    if (!is.null(cursor)) body$start_cursor <- cursor
-    resp <- notion_req(url) |> req_body_json(body, auto_unbox = TRUE) |> perform(tag = "QUERY ALL")
-    if (is_err(resp)) { show_err(resp); break }
+  # Candidate keys (unique & non-empty)
+  urls <- unique(na.omit(as.character(rows$tweet_url)))
+  urls <- urls[nzchar(urls)]
+  tids <- unique(na.omit(as.character(rows$tweet_id)))
+  tids <- tids[nzchar(tids)]
+
+  # Helper to run one Notion query with up to ~50 OR terms
+  run_chunk <- function(urls_chunk, tids_chunk) {
+    ors <- list()
+
+    if (!is.null(PROPS$tweet_url) && identical(PROPS$tweet_url$type, "url")) {
+      for (u in urls_chunk) ors[[length(ors)+1]] <- list(property="tweet_url", url=list(equals=u))
+    }
+
+    if (!is.null(PROPS$tweet_id)) {
+      if (identical(PROPS$tweet_id$type, "rich_text")) {
+        for (t in tids_chunk) ors[[length(ors)+1]] <- list(property="tweet_id", rich_text=list(equals=t))
+      } else if (identical(PROPS$tweet_id$type, "number")) {
+        # NOTE: numbers may lose precision for Twitter snowflakes; prefer rich_text in your DB.
+        for (t in tids_chunk) {
+          num <- suppressWarnings(as.numeric(t))
+          if (is.finite(num)) ors[[length(ors)+1]] <- list(property="tweet_id", number=list(equals=num))
+        }
+      }
+    }
+
+    if (!length(ors)) return(invisible(NULL))
+    body <- list(filter = list(or = ors), page_size = 100)
+    resp <- notion_req(paste0("https://api.notion.com/v1/databases/", DB_ID, "/query")) |>
+      req_body_json(body, auto_unbox = TRUE) |>
+      perform(tag="POST /databases/query (lazy)")
+    if (is_err(resp)) { show_err(resp); return(invisible(NULL)) }
     out <- resp_body_json(resp, simplifyVector = FALSE)
 
     for (pg in out$results) {
       pid <- pg$id
+
+      # title
       tnodes <- pg$properties[[TITLE_PROP]]$title
       ttl <- if (length(tnodes)) paste0(vapply(tnodes, \(x) x$plain_text %||% "", character(1L)), collapse = "") else ""
-      if (nzchar(ttl)) by_title[[ttl]] <- pid
+      if (nzchar(ttl)) by_ttl[[ttl]] <- pid
 
-      if (!is.null(PROPS$tweet_id)) {
-        tid <- ""
-        if (identical(PROPS$tweet_id$type, "rich_text")) {
-          rt <- pg$properties$tweet_id$rich_text
-          tid <- if (length(rt)) paste0(vapply(rt, \(x) x$plain_text %||% "", character(1L)), collapse = "") else ""
-        } else if (identical(PROPS$tweet_id$type, "number")) {
-          num <- pg$properties$tweet_id$number %||% NA
-          if (!is.na(num)) tid <- as.character(num)
-        }
-        if (nzchar(tid)) by_tid[[tid]] <- pid
-      }
-
+      # url
       if (!is.null(PROPS$tweet_url) && identical(PROPS$tweet_url$type, "url")) {
         u <- pg$properties$tweet_url$url %||% ""
         if (nzchar(u)) by_url[[u]] <- pid
       }
 
-      n <- n + 1L
+      # tweet_id
+      if (!is.null(PROPS$tweet_id)) {
+        if (identical(PROPS$tweet_id$type, "rich_text")) {
+          rt <- pg$properties$tweet_id$rich_text
+          tid <- if (length(rt)) paste0(vapply(rt, \(x) x$plain_text %||% "", character(1L)), collapse = "") else ""
+          if (nzchar(tid)) by_tid[[tid]] <- pid
+        } else if (identical(PROPS$tweet_id$type, "number")) {
+          num <- pg$properties$tweet_id$number %||% NA
+          if (!is.na(num)) by_tid[[as.character(num)]] <- pid
+        }
+      }
     }
-    if (isTRUE(out$has_more)) cursor <- out$next_cursor else break
   }
-  message(sprintf("Indexed %d Notion pages (title, tweet_id, tweet_url).", n))
-  list(by_title = by_title, by_tid = by_tid, by_url = by_url)
+
+  # chunk ≈ 50 keys per request (mix of urls & tids)
+  i <- 1L
+  while (i <= max(length(urls), length(tids))) {
+    u_slice <- if (length(urls)) urls[i:min(i+49, length(urls))] else character()
+    t_slice <- if (length(tids)) tids[i:min(i+49, length(tids))] else character()
+    run_chunk(u_slice, t_slice)
+    i <- i + 50L
+    Sys.sleep(RATE_DELAY_SEC/2)  # tiny pause between index queries
+  }
+
+  list(by_url=by_url, by_tid=by_tid, by_title=by_ttl)
 }
 
-# --- CRUD wrappers -----------------------------------------------------------
+# --- CRUD --------------------------------------------------------------------
 create_page <- function(pr) {
   body <- list(parent = list(database_id = DB_ID), properties = pr)
   resp <- notion_req("https://api.notion.com/v1/pages") |>
@@ -277,9 +282,9 @@ update_page <- function(page_id, pr) {
   TRUE
 }
 
-# --- B) Upsert using pre-index (URL → tweet_id → title)
+# --- B) Upsert with lazy index (URL → tweet_id → title) ----------------------
 upsert_row <- function(r, idx = NULL) {
-  title_val <- paste0(r$username %||% "", " • ", r$tweet_id %||% r$text %||% "untitled")
+  title_val <- if (nzchar(as.character(r$tweet_id %||% ""))) as.character(r$tweet_id) else paste0(r$username %||% "", " • ", r$text %||% "untitled")
   pr_full   <- props_from_row(r)
 
   pid <- NA_character_
@@ -298,7 +303,7 @@ upsert_row <- function(r, idx = NULL) {
       pid <- idx$by_title[[title_val]]; if (is.null(pid)) pid <- NA_character_
     }
   } else {
-    pid <- find_page_by_title_eq(title_val)
+    pid <- find_page_by_title_eq(title_val)  # slow fallback
   }
 
   if (!is.na(pid[1])) {
@@ -307,16 +312,9 @@ upsert_row <- function(r, idx = NULL) {
   }
 
   pid2 <- create_page(pr_full)
-  if (!is.na(pid2[1])) {
-    if (!is.null(idx)) {
-      idx$by_title[[title_val]] <- pid2
-      if (nzchar(url_chr)) idx$by_url[[url_chr]] <- pid2
-      tid_chr <- as.character(r$tweet_id %||% "")
-      if (!is.null(PROPS$tweet_id) && nzchar(tid_chr)) idx$by_tid[[tid_chr]] <- pid2
-    }
-    return(TRUE)
-  }
+  if (!is.na(pid2[1])) return(TRUE)
 
+  # minimal create then patch (belt & suspenders)
   pr_min <- list(); pr_min[[TITLE_PROP]] <- set_prop(TITLE_PROP, title_val)
   pid3 <- create_page(pr_min)
   if (is.na(pid3[1])) return(FALSE)
@@ -324,7 +322,7 @@ upsert_row <- function(r, idx = NULL) {
   is.logical(ok2) && ok2
 }
 
-# --- Supabase (Postgres) -----------------------------------------------------
+# --- Supabase connection -----------------------------------------------------
 supa_host <- Sys.getenv("SUPABASE_HOST")
 supa_user <- Sys.getenv("SUPABASE_USER")
 supa_pwd  <- Sys.getenv("SUPABASE_PWD")
@@ -343,26 +341,31 @@ con <- DBI::dbConnect(
 since <- as.POSIXct(Sys.time(), tz = "UTC") - LOOKBACK_HOURS * 3600
 since_str <- format(since, "%Y-%m-%d %H:%M:%S%z")
 
-# --- Build SQL (base WHERE) ---------------------------------------------------
+# Base WHERE
 base_where <- if (IMPORT_ALL) "TRUE" else paste0("date >= TIMESTAMPTZ ", DBI::dbQuoteString(con, since_str))
 user_clause <- if (nzchar(USERNAME_FILTER)) paste0(" AND username = ", DBI::dbQuoteString(con, USERNAME_FILTER)) else ""
 
-# Expected total under this filter (coerce safely for printing with %d)
-exp_sql <- sprintf("SELECT COUNT(*) AS n FROM twitter_raw WHERE %s%s", base_where, user_clause)
+# Expected DISTINCT tweets under this filter (by stable key)
+exp_sql <- sprintf("
+  SELECT COUNT(*) AS n FROM (
+    SELECT DISTINCT COALESCE(tweet_url, CAST(tweet_id AS TEXT)) AS key
+    FROM twitter_raw
+    WHERE %s%s
+  ) t
+", base_where, user_clause)
 expected_raw <- DBI::dbGetQuery(con, exp_sql)$n[1]
-if (inherits(expected_raw, "integer64")) expected_raw <- as.numeric(expected_raw)
 expected_num <- suppressWarnings(as.numeric(expected_raw))
 if (!is.finite(expected_num)) expected_num <- 0
 expected_i <- as.integer(round(expected_num))
-message(sprintf("Expected rows under this filter: %d", expected_i))
+message(sprintf("Expected distinct tweets under this filter: %d", expected_i))
 
-# Optional smoke test (skip during big backfills)
+# Optional smoke test
 if (RUN_SMOKE_TEST) {
   smoke_title <- paste0("ping ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"))
   smoke_pid <- create_page(setNames(list(set_prop(TITLE_PROP, smoke_title)), TITLE_PROP))
   if (is_err(smoke_pid) || is.na(smoke_pid[1])) {
     cat("\n🔥 Smoke test FAILED — cannot create even a minimal page in this database.\n",
-        "Confirm the integration is connected to THIS database and has insert/update permissions.\n", sep = "")
+        "Confirm the integration has access to THIS database.\n", sep = "")
     if (is_err(smoke_pid)) show_err(smoke_pid)
     quit(status = 1L, save = "no")
   } else {
@@ -376,35 +379,48 @@ if (RUN_SMOKE_TEST) {
 # Optional one-row inspector
 if (INSPECT_FIRST_ROW) {
   test_q <- sprintf("
-    SELECT
-      tweet_id, tweet_url, username, user_id, text,
-      reply_count, retweet_count, like_count, quote_count, bookmarked_count,
-      view_count, date, is_quote, is_retweet, engagement_rate
-    FROM twitter_raw
-    WHERE %s%s
+    WITH ranked AS (
+      SELECT *,
+             ROW_NUMBER() OVER (PARTITION BY COALESCE(tweet_url, CAST(tweet_id AS TEXT))
+                                ORDER BY date DESC) AS rn
+      FROM twitter_raw
+      WHERE %s%s
+    )
+    SELECT tweet_id, tweet_url, username, user_id, text,
+           reply_count, retweet_count, like_count, quote_count, bookmarked_count,
+           view_count, date, is_quote, is_retweet, engagement_rate
+    FROM ranked
+    WHERE rn = 1
     ORDER BY date %s
     LIMIT 1 OFFSET %d
   ", base_where, user_clause, ORDER_DIR, CHUNK_OFFSET)
   one <- DBI::dbGetQuery(con, test_q)
-  if (nrow(one)) explain_props(one[1, , drop = FALSE])
+  if (nrow(one)) {
+    # coerce date for inspector
+    one$date <- parse_dt(one$date)
+    explain_props(one[1, , drop = FALSE])
+  }
 }
 
-# --- Build Notion index once (big speed-up) ----------------------------------
-idx <- fetch_notion_index()
-
-# --- C) Auto-page through Supabase until done --------------------------------
+# --- Main loop: page through Supabase ----------------------------------------
 offset <- CHUNK_OFFSET
 total_success <- 0L
 total_seen    <- 0L
 
 repeat {
   qry <- sprintf("
-    SELECT
-      tweet_id, tweet_url, username, user_id, text,
-      reply_count, retweet_count, like_count, quote_count, bookmarked_count,
-      view_count, date, is_quote, is_retweet, engagement_rate
-    FROM twitter_raw
-    WHERE %s%s
+    WITH ranked AS (
+      SELECT *,
+             ROW_NUMBER() OVER (PARTITION BY COALESCE(tweet_url, CAST(tweet_id AS TEXT))
+                                ORDER BY date DESC) AS rn
+      FROM twitter_raw
+      WHERE %s%s
+    )
+    SELECT tweet_id, tweet_url, username, user_id, text,
+           reply_count, retweet_count, like_count, quote_count, bookmarked_count,
+           view_count, date, is_quote, is_retweet, engagement_rate
+    FROM ranked
+    WHERE rn = 1
     ORDER BY date %s
     LIMIT %d OFFSET %d
   ", base_where, user_clause, ORDER_DIR, CHUNK_SIZE, offset)
@@ -413,22 +429,23 @@ repeat {
   n <- nrow(rows)
   if (!n) break
 
-  message(sprintf("Fetched %d rows (offset=%d). USERNAME_FILTER=%s ORDER_DIR=%s CHUNK_SIZE=%d",
+  message(sprintf("Fetched %d distinct tweets (offset=%d). USERNAME_FILTER=%s ORDER_DIR=%s CHUNK_SIZE=%d",
                   n, offset, ifelse(nzchar(USERNAME_FILTER), USERNAME_FILTER, "<none>"), ORDER_DIR, CHUNK_SIZE))
 
+  # Build a tiny Notion index just for this page of rows
+  idx <- build_index_for_rows(rows)
+
+  # Optional who’s in this page
   message("Top usernames in this chunk:")
   print(utils::head(sort(table(rows$username), decreasing = TRUE), 10))
 
   success <- 0L
   for (i in seq_len(n)) {
     r <- rows[i, , drop = FALSE]
-
     if (!is.null(r$date)) {
       d <- parse_dt(r$date); if (is.na(d)) r$date <- NULL else r$date <- d
     }
-
     message(sprintf("Upserting %s | %s", as.character(r$username), as.character(r$tweet_id)))
-
     ok <- upsert_row(r, idx = idx)
     if (ok) success <- success + 1L else message(sprintf("Row %d failed (tweet_id=%s)", i, as.character(r$tweet_id)))
     if (i %% 50 == 0) message(sprintf("Processed %d/%d in this page (ok %d)", i, n, success))
@@ -444,5 +461,6 @@ repeat {
 }
 
 DBI::dbDisconnect(con)
-message(sprintf("All pages done. Upserts ok: %d. Expected under filter: %d", total_success, expected_i))
+message(sprintf("All pages done. Upserts ok: %d. Expected distinct under filter: %d", total_success, expected_i))
+
 
