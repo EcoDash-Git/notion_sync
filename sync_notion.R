@@ -35,7 +35,8 @@ if (!nzchar(NOTION_TOKEN) || !nzchar(DB_ID)) stop("Set NOTION_TOKEN and NOTION_D
 `%||%` <- function(x, y) if (is.null(x) || is.na(x) || x == "") y else x
 rtxt <- function(x) {
   s <- as.character(x %||% "")
-  if (identical(s, "")) list() else list(list(type="text", text=list(content=substr(s, 1800))))
+  if (identical(s, "")) list()
+  else list(list(type="text", text=list(content=substr(s, 1, 1800))))
 }
 
 # robust datetime coercion (returns POSIXct(NA) if it can’t parse)
@@ -429,7 +430,3 @@ if (nrow(rows)) {
 } else {
   message("Nothing to sync in this chunk.")
 }
-
-
-
-
