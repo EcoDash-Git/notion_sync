@@ -153,6 +153,9 @@ set_prop <- function(name, value) {
     list(date = list(start = format(d, "%Y-%m-%dT%H:%M:%SZ")))
   } else if (tp == "checkbox") {
     list(checkbox = to_bool(value))
+  } else if (tp == "select") {                # ← added: support Notion select
+    v <- as.character(value %||% ""); if (!nzchar(v)) return(NULL)
+    list(select = list(name = v))
   } else NULL
 }
 
@@ -168,7 +171,8 @@ props_from_row <- function(r) {
 
   for (nm in c("username","user_id","text","tweet_url","reply_count",
                "retweet_count","like_count","quote_count","bookmarked_count",
-               "view_count","date","is_quote","is_retweet","engagement_rate","tweet_id")) {
+               "view_count","date","is_quote","is_retweet","engagement_rate",
+               "tweet_id","tweet_type")) {       # ← added tweet_type
     if (!is.null(PROPS[[nm]]) && !is.null(r[[nm]])) pr[[nm]] <- set_prop(nm, r[[nm]])
   }
   pr
@@ -373,25 +377,59 @@ if (RUN_SMOKE_TEST) {
 # Optional one-row inspector
 if (INSPECT_FIRST_ROW) {
   test_q <- sprintf("
-    WITH ranked AS (
-      SELECT *,
-             ROW_NUMBER() OVER (PARTITION BY COALESCE(tweet_url, CAST(tweet_id AS TEXT))
-                                ORDER BY date DESC) AS rn
-      FROM twitter_raw
+    WITH ranked_raw AS (
+      SELECT r.*,
+             ROW_NUMBER() OVER (
+               PARTITION BY COALESCE(r.tweet_url, CAST(r.tweet_id AS TEXT))
+               ORDER BY r.date DESC
+             ) AS rn
+      FROM twitter_raw r
       WHERE %s%s
+    ),
+    latest_flags AS (
+      SELECT f.*,
+             ROW_NUMBER() OVER (
+               PARTITION BY COALESCE(f.tweet_url, CAST(f.tweet_id AS TEXT))
+               ORDER BY f.date DESC NULLS LAST
+             ) AS rn
+      FROM twitter_raw_plus_flags f
     )
-    SELECT tweet_id, tweet_url, username, user_id, text,
-           reply_count, retweet_count, like_count, quote_count, bookmarked_count,
-           view_count, date, is_quote, is_retweet, engagement_rate
-    FROM ranked
-    WHERE rn = 1
-    ORDER BY date %s
+    SELECT
+      rr.tweet_id,
+      rr.tweet_url,
+      rr.username,
+      rr.user_id,
+      rr.text,
+      rr.reply_count,
+      rr.retweet_count,
+      rr.like_count,
+      rr.quote_count,
+      rr.bookmarked_count,
+      rr.view_count,
+      rr.date,
+      rr.is_quote,
+      rr.is_retweet,
+      rr.engagement_rate,
+      COALESCE(lf.tweet_type,
+               CASE
+                 WHEN rr.is_retweet THEN 'retweet'
+                 WHEN rr.is_quote   THEN 'quote'
+                 ELSE 'original'
+               END) AS tweet_type
+    FROM ranked_raw rr
+    LEFT JOIN latest_flags lf
+      ON COALESCE(rr.tweet_url, CAST(rr.tweet_id AS TEXT))
+       = COALESCE(lf.tweet_url, CAST(lf.tweet_id AS TEXT))
+     AND lf.rn = 1
+    WHERE rr.rn = 1
+    ORDER BY rr.date %s
     LIMIT 1 OFFSET %d
   ", base_where, user_clause, ORDER_DIR, CHUNK_OFFSET)
   one <- DBI::dbGetQuery(con, test_q)
   if (nrow(one)) {
     one$date <- parse_dt(one$date)
-    explain_props(one[1, , drop = FALSE])
+    # If you have an explain_props() helper, you can call it here.
+    # explain_props(one[1, , drop = FALSE])
   }
 }
 
@@ -402,19 +440,52 @@ total_seen    <- 0L
 
 repeat {
   qry <- sprintf("
-    WITH ranked AS (
-      SELECT *,
-             ROW_NUMBER() OVER (PARTITION BY COALESCE(tweet_url, CAST(tweet_id AS TEXT))
-                                ORDER BY date DESC) AS rn
-      FROM twitter_raw
+    WITH ranked_raw AS (
+      SELECT r.*,
+             ROW_NUMBER() OVER (
+               PARTITION BY COALESCE(r.tweet_url, CAST(r.tweet_id AS TEXT))
+               ORDER BY r.date DESC
+             ) AS rn
+      FROM twitter_raw r
       WHERE %s%s
+    ),
+    latest_flags AS (
+      SELECT f.*,
+             ROW_NUMBER() OVER (
+               PARTITION BY COALESCE(f.tweet_url, CAST(f.tweet_id AS TEXT))
+               ORDER BY f.date DESC NULLS LAST
+             ) AS rn
+      FROM twitter_raw_plus_flags f
     )
-    SELECT tweet_id, tweet_url, username, user_id, text,
-           reply_count, retweet_count, like_count, quote_count, bookmarked_count,
-           view_count, date, is_quote, is_retweet, engagement_rate
-    FROM ranked
-    WHERE rn = 1
-    ORDER BY date %s
+    SELECT
+      rr.tweet_id,
+      rr.tweet_url,
+      rr.username,
+      rr.user_id,
+      rr.text,
+      rr.reply_count,
+      rr.retweet_count,
+      rr.like_count,
+      rr.quote_count,
+      rr.bookmarked_count,
+      rr.view_count,
+      rr.date,
+      rr.is_quote,
+      rr.is_retweet,
+      rr.engagement_rate,
+      COALESCE(lf.tweet_type,
+               CASE
+                 WHEN rr.is_retweet THEN 'retweet'
+                 WHEN rr.is_quote   THEN 'quote'
+                 ELSE 'original'
+               END) AS tweet_type
+    FROM ranked_raw rr
+    LEFT JOIN latest_flags lf
+      ON COALESCE(rr.tweet_url, CAST(rr.tweet_id AS TEXT))
+       = COALESCE(lf.tweet_url, CAST(lf.tweet_id AS TEXT))
+     AND lf.rn = 1
+    WHERE rr.rn = 1
+    ORDER BY rr.date %s
     LIMIT %d OFFSET %d
   ", base_where, user_clause, ORDER_DIR, CHUNK_SIZE, offset)
 
