@@ -112,7 +112,7 @@ jobs:
           # Filters
           USERNAME_FILTER:     ${{ inputs.username_filter || '' }}
           IMPORT_ALL:          ${{ inputs.import_all      || 'false' }}
-        run: Rscript notion_sync.R
+        run: Rscript sync_notion.R
 
       - name: Auto-continue next chunk
         if: ${{ steps.run.outputs.next_offset && steps.run.outputs.next_offset != 'done' }}
