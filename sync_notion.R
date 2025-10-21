@@ -491,3 +491,4 @@ message(sprintf("All pages done. Upserts ok: %d. Expected distinct under filter:
 # Tell the workflow we’re finished
 go <- Sys.getenv("GITHUB_OUTPUT")
 if (nzchar(go)) write("next_offset=done", file = go, append = TRUE)
+
