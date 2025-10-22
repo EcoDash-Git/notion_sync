@@ -109,18 +109,13 @@ jobs:
             fi
 
             if [ "$code" = "429" ] && [ $tries -lt $max_tries ]; then
-              ra=$(awk 'tolower($1)=="retry-after:"{print $2}' /tmp/headers | tr -d '\r')
+              ra=$(awk 'tolower($1)=="retry-after:"{print $2}' /tmp/headers | tr -d "\r")
               if [ -n "$ra" ]; then
                 echo "Rate limited. Retry-After: ${ra}s"
                 sleep "$ra"
               else
-                # exponential backoff with jitter, capped at 10s
-                wait=$(python3 - <<PY
-import math, random
-t = $tries
-print(min(10, 0.5*(2**(t-1)) + random.random()))
-PY
-)
+                # exponential backoff with jitter, capped at 10s (pure awk)
+                wait=$(awk -v t="$tries" 'BEGIN{srand(); w=0.5*(2^(t-1))+rand(); if(w>10) w=10; printf "%.2f", w}')
                 echo "Rate limited. Backing off ${wait}s"
                 sleep "$wait"
               fi
@@ -170,4 +165,3 @@ PY
             -f rate_delay=${{ inputs.rate_delay || '0.35' }} \
             -f username_filter="${{ inputs.username_filter || '' }}" \
             -f import_all=${{ inputs.import_all || 'false' }}
-
