@@ -7,33 +7,33 @@ on:
   workflow_dispatch:
     inputs:
       chunk_offset:
-        description: 'Start offset'
+        description: "Start offset"
         required: false
-        default: '0'
+        default: "0"
       max_rows:
-        description: 'Max rows per run'
+        description: "Max rows per run"
         required: false
-        default: '1200'
+        default: "800"
       max_minutes:
-        description: 'Max minutes per run'
+        description: "Max minutes per run"
         required: false
-        default: '110'
+        default: "110"
       chunk_size:
-        description: 'Rows per page (SQL LIMIT)'
+        description: "Rows per page (SQL LIMIT)"
         required: false
-        default: '800'
+        default: "600"
       rate_delay:
-        description: 'Seconds between writes'
+        description: "Seconds between writes"
         required: false
-        default: '0.35'
+        default: "0.35"
       username_filter:
-        description: 'Optional username filter (e.g., HyMatrixOrg)'
+        description: "Optional username filter (e.g., HyMatrixOrg)"
         required: false
-        default: ''
+        default: ""
       import_all:
-        description: 'Ignore lookback window and fetch ALL history (true/false)'
+        description: "Ignore lookback window and fetch ALL history (true/false)"
         required: false
-        default: 'false'
+        default: "false"
 
 permissions:
   actions: write
@@ -55,7 +55,7 @@ jobs:
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
         with:
-          r-version: '4.3.3'
+          r-version: "4.3.3"
           use-public-rspm: true
 
       - name: Install system libraries (for RPostgres/curl)
@@ -72,20 +72,24 @@ jobs:
 
       - id: nytime
         name: Get New York hour
-        run: echo "hour=$(TZ=America/New_York date +%H)" >> $GITHUB_OUTPUT
+        run: echo "hour=$(TZ=America/New_York date +%H)" >> "$GITHUB_OUTPUT"
 
       # ✅ Cache common R packages to save setup time
-      - uses: r-lib/actions/setup-r-dependencies@v2
+      - name: Cache R deps
+        uses: r-lib/actions/setup-r-dependencies@v2
         with:
-          packages: |
+          extra-packages: |
             any::httr2
             any::jsonlite
             any::DBI
             any::RPostgres
-          cache: true
+          cache-version: 1
 
-      # ✅ Preflight check with retry logic
+      # ✅ Preflight check with retry logic (handles 429 rate limits)
       - name: Preflight – Notion auth check (with retries)
+        env:
+          NOTION_TOKEN:       ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: |
           set -e
           url="https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}"
@@ -98,6 +102,7 @@ jobs:
               -H "Notion-Version: 2022-06-28" \
               "$url")
             echo "HTTP ${code}"
+
             if [ "$code" = "200" ]; then
               echo "✅ Notion DB schema fetch OK."
               break
@@ -105,15 +110,19 @@ jobs:
 
             if [ "$code" = "429" ] && [ $tries -lt $max_tries ]; then
               ra=$(awk 'tolower($1)=="retry-after:"{print $2}' /tmp/headers | tr -d '\r')
-              if [ -z "$ra" ]; then
-                base=$(python3 - <<'PY'
-import math,random,sys
-t=int(sys.argv[1]); print(min(10, 0.5*(2**(t-1)) + random.random()))
-PY
-"$tries")
-                sleep "$base"
-              else
+              if [ -n "$ra" ]; then
+                echo "Rate limited. Retry-After: ${ra}s"
                 sleep "$ra"
+              else
+                # exponential backoff with jitter, capped at 10s
+                wait=$(python3 - <<PY
+import math, random
+t = $tries
+print(min(10, 0.5*(2**(t-1)) + random.random()))
+PY
+)
+                echo "Rate limited. Backing off ${wait}s"
+                sleep "$wait"
               fi
               continue
             fi
@@ -122,9 +131,6 @@ PY
             sed -E 's/"access_token":"[^"]+"/"access_token":"***"/g' /tmp/notion.json | head -200
             exit 1
           done
-        env:
-          NOTION_TOKEN:        ${{ secrets.NOTION_TOKEN }}
-          NOTION_DATABASE_ID:  ${{ secrets.NOTION_DATABASE_ID }}
 
       - id: run
         name: Run sync
@@ -143,7 +149,7 @@ PY
           MAX_ROWS_PER_RUN:    ${{ inputs.max_rows       || '800' }}
           MAX_MINUTES:         ${{ inputs.max_minutes    || '110' }}
           # Performance knobs
-          CHUNK_SIZE:          ${{ inputs.chunk_size     || '600'  }}
+          CHUNK_SIZE:          ${{ inputs.chunk_size     || '600' }}
           RATE_DELAY_SEC:      ${{ inputs.rate_delay     || '0.35' }}
           # Filters
           USERNAME_FILTER:     ${{ inputs.username_filter || '' }}
@@ -163,4 +169,4 @@ PY
             -f chunk_size=${{ inputs.chunk_size || '600' }} \
             -f rate_delay=${{ inputs.rate_delay || '0.35' }} \
             -f username_filter="${{ inputs.username_filter || '' }}" \
-            -f import_all=${{ inputs.import_all || 'false' }}"
+            -f import_all=${{ inputs.import_all || 'false' }}
