@@ -25,7 +25,7 @@ on:
       rate_delay:
         description: 'Seconds between writes'
         required: false
-        default: '0.20'
+        default: '0.35'
       username_filter:
         description: 'Optional username filter (e.g., HyMatrixOrg)'
         required: false
@@ -38,6 +38,10 @@ on:
 permissions:
   actions: write
   contents: read
+
+concurrency:
+  group: notion-sync-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   sync:
@@ -70,22 +74,54 @@ jobs:
         name: Get New York hour
         run: echo "hour=$(TZ=America/New_York date +%H)" >> $GITHUB_OUTPUT
 
-      # ✅ Preflight: verify Notion credentials and DB access before running R
-      - name: Preflight – Notion auth check
+      # ✅ Cache common R packages to save setup time
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::httr2
+            any::jsonlite
+            any::DBI
+            any::RPostgres
+          cache: true
+
+      # ✅ Preflight check with retry logic
+      - name: Preflight – Notion auth check (with retries)
         run: |
           set -e
-          echo "Checking /v1/databases/${NOTION_DATABASE_ID}…"
-          code=$(curl -s -o /tmp/notion.json -w "%{http_code}" \
-            -H "Authorization: Bearer ${NOTION_TOKEN}" \
-            -H "Notion-Version: 2022-06-28" \
-            https://api.notion.com/v1/databases/${NOTION_DATABASE_ID})
-          echo "HTTP ${code}"
-          if [ "$code" != "200" ]; then
-            echo "::error title=Notion API failed::See payload below (most fields redacted)."
+          url="https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}"
+          tries=0
+          max_tries=8
+          while :; do
+            tries=$((tries+1))
+            code=$(curl -s -D /tmp/headers -o /tmp/notion.json -w "%{http_code}" \
+              -H "Authorization: Bearer ${NOTION_TOKEN}" \
+              -H "Notion-Version: 2022-06-28" \
+              "$url")
+            echo "HTTP ${code}"
+            if [ "$code" = "200" ]; then
+              echo "✅ Notion DB schema fetch OK."
+              break
+            fi
+
+            if [ "$code" = "429" ] && [ $tries -lt $max_tries ]; then
+              ra=$(awk 'tolower($1)=="retry-after:"{print $2}' /tmp/headers | tr -d '\r')
+              if [ -z "$ra" ]; then
+                base=$(python3 - <<'PY'
+import math,random,sys
+t=int(sys.argv[1]); print(min(10, 0.5*(2**(t-1)) + random.random()))
+PY
+"$tries")
+                sleep "$base"
+              else
+                sleep "$ra"
+              fi
+              continue
+            fi
+
+            echo "::error title=Notion API failed::See payload below (fields redacted)."
             sed -E 's/"access_token":"[^"]+"/"access_token":"***"/g' /tmp/notion.json | head -200
             exit 1
-          fi
-          echo "✅ Notion DB schema fetch OK."
+          done
         env:
           NOTION_TOKEN:        ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID:  ${{ secrets.NOTION_DATABASE_ID }}
@@ -104,11 +140,11 @@ jobs:
           LOOKBACK_HOURS:      "17532"
           # Resumability knobs
           CHUNK_OFFSET:        ${{ inputs.chunk_offset   || '0' }}
-          MAX_ROWS_PER_RUN:    ${{ inputs.max_rows       || '1200' }}
+          MAX_ROWS_PER_RUN:    ${{ inputs.max_rows       || '800' }}
           MAX_MINUTES:         ${{ inputs.max_minutes    || '110' }}
           # Performance knobs
-          CHUNK_SIZE:          ${{ inputs.chunk_size     || '800' }}
-          RATE_DELAY_SEC:      ${{ inputs.rate_delay     || '0.20' }}
+          CHUNK_SIZE:          ${{ inputs.chunk_size     || '600'  }}
+          RATE_DELAY_SEC:      ${{ inputs.rate_delay     || '0.35' }}
           # Filters
           USERNAME_FILTER:     ${{ inputs.username_filter || '' }}
           IMPORT_ALL:          ${{ inputs.import_all      || 'false' }}
@@ -122,9 +158,9 @@ jobs:
           echo "Queuing next run from offset ${{ steps.run.outputs.next_offset }}..."
           gh workflow run "${{ github.workflow }}" \
             -f chunk_offset=${{ steps.run.outputs.next_offset }} \
-            -f max_rows=${{ inputs.max_rows || '1200' }} \
+            -f max_rows=${{ inputs.max_rows || '800' }} \
             -f max_minutes=${{ inputs.max_minutes || '110' }} \
-            -f chunk_size=${{ inputs.chunk_size || '800' }} \
-            -f rate_delay=${{ inputs.rate_delay || '0.20' }} \
+            -f chunk_size=${{ inputs.chunk_size || '600' }} \
+            -f rate_delay=${{ inputs.rate_delay || '0.35' }} \
             -f username_filter="${{ inputs.username_filter || '' }}" \
-            -f import_all=${{ inputs.import_all || 'false' }}
+            -f import_all=${{ inputs.import_all || 'false' }}"
