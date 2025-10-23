@@ -1,11 +1,15 @@
 name: Sync Supabase → Notion
 
 on:
+  # Run frequently; a cheap gate will allow only the desired times.
   schedule:
-    - cron: "0 15 * * *"   # 11:00 in New York during EDT (UTC-4)
-    - cron: "0 16 * * *"   # 11:00 in New York during EST (UTC-5)
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
+      sync_mode:
+        description: "all | priority"
+        required: false
+        default: "all"
       chunk_offset:
         description: "Start offset"
         required: false
@@ -27,7 +31,7 @@ on:
         required: false
         default: "0.35"
       username_filter:
-        description: "Optional username filter (e.g., HyMatrixOrg)"
+        description: "Optional single username filter (legacy)"
         required: false
         default: ""
       import_all:
@@ -44,7 +48,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run_mode: ${{ steps.pick.outputs.run_mode }} # 'all' | 'priority' | 'none' | 'manual'
+    steps:
+      - id: pick
+        run: |
+          # Europe/Paris covers CET/CEST correctly.
+          HOUR=$(TZ=Europe/Paris date +%H)
+          MIN=$(TZ=Europe/Paris date +%M)
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run_mode=manual" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Allow only at 05:00 (ALL) and 14:00 (PRIORITY)
+          if [ "$HOUR" = "05" ] && [ "$MIN" = "00" ]; then
+            echo "run_mode=all" >> "$GITHUB_OUTPUT"
+          elif [ "$HOUR" = "14" ] && [ "$MIN" = "00" ]; then
+            echo "run_mode=priority" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_mode=none" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Europe/Paris time: $HOUR:$MIN → ${{ steps.pick.outputs.run_mode }}"
+
   sync:
+    needs: gate
+    if: ${{ needs.gate.outputs.run_mode != 'none' }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -70,11 +103,7 @@ jobs:
             sudo apt-get install -y gh
           fi
 
-      - id: nytime
-        name: Get New York hour
-        run: echo "hour=$(TZ=America/New_York date +%H)" >> "$GITHUB_OUTPUT"
-
-      # ✅ Cache common R packages to save setup time
+      # Cache common R packages
       - name: Cache R deps
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
@@ -85,7 +114,7 @@ jobs:
             any::RPostgres
           cache-version: 1
 
-      # ✅ Preflight check with retry logic (handles 429 rate limits)
+      # Preflight with retry/backoff on 429
       - name: Preflight – Notion auth check (with retries)
         env:
           NOTION_TOKEN:       ${{ secrets.NOTION_TOKEN }}
@@ -114,7 +143,6 @@ jobs:
                 echo "Rate limited. Retry-After: ${ra}s"
                 sleep "$ra"
               else
-                # exponential backoff with jitter, capped at 10s (pure awk)
                 wait=$(awk -v t="$tries" 'BEGIN{srand(); w=0.5*(2^(t-1))+rand(); if(w>10) w=10; printf "%.2f", w}')
                 echo "Rate limited. Backing off ${wait}s"
                 sleep "$wait"
@@ -129,7 +157,6 @@ jobs:
 
       - id: run
         name: Run sync
-        if: ${{ github.event_name != 'schedule' || steps.nytime.outputs.hour == '11' }}
         env:
           NOTION_TOKEN:        ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID:  ${{ secrets.NOTION_DATABASE_ID }}
@@ -146,7 +173,10 @@ jobs:
           # Performance knobs
           CHUNK_SIZE:          ${{ inputs.chunk_size     || '600' }}
           RATE_DELAY_SEC:      ${{ inputs.rate_delay     || '0.35' }}
-          # Filters
+          # Filters / Mode
+          SYNC_MODE: >-
+            ${{ (github.event_name == 'workflow_dispatch' && inputs.sync_mode) || needs.gate.outputs.run_mode }}
+          PRIORITY_USERNAMES:  ${{ vars.TW_PRIORITY_HANDLES }}   # e.g. "HyMatrixOrg,outprog,EverVisionLabs"
           USERNAME_FILTER:     ${{ inputs.username_filter || '' }}
           IMPORT_ALL:          ${{ inputs.import_all      || 'false' }}
         run: Rscript sync_notion.R
@@ -158,6 +188,7 @@ jobs:
         run: |
           echo "Queuing next run from offset ${{ steps.run.outputs.next_offset }}..."
           gh workflow run "${{ github.workflow }}" \
+            -f sync_mode=${{ env.SYNC_MODE }} \
             -f chunk_offset=${{ steps.run.outputs.next_offset }} \
             -f max_rows=${{ inputs.max_rows || '800' }} \
             -f max_minutes=${{ inputs.max_minutes || '110' }} \
