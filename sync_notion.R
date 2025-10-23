@@ -3,6 +3,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Supabase (Postgres) → Notion (paged, lazy preindex, SQL de-dupe, resumable)
 # Source table: twitter_raw_plus_flags (single source of truth)
+# Modes:
+#   SYNC_MODE = "all"       → sync all rows (within lookback unless IMPORT_ALL)
+#   SYNC_MODE = "priority"  → sync only PRIORITY_USERNAMES
+#   USERNAME_FILTER (if set) overrides both modes and selects a single username
 # ─────────────────────────────────────────────────────────────────────────────
 
 # --- packages ----------------------------------------------------------------
@@ -21,14 +25,28 @@ NUM_NA_AS_ZERO     <- tolower(Sys.getenv("NUM_NA_AS_ZERO","false")) %in% c("1","
 INSPECT_FIRST_ROW  <- tolower(Sys.getenv("INSPECT_FIRST_ROW","false")) %in% c("1","true","yes")
 DUMP_SCHEMA        <- tolower(Sys.getenv("DUMP_SCHEMA","false"))       %in% c("1","true","yes")
 RATE_DELAY_SEC     <- as.numeric(Sys.getenv("RATE_DELAY_SEC","0.20"))
-IMPORT_ALL         <- tolower(Sys.getenv("IMPORT_ALL","false"))        %in% c("1","true","yes")
-RUN_SMOKE_TEST     <- tolower(Sys.getenv("RUN_SMOKE_TEST","false"))    %in% c("1","true","yes")
+IMPORT_ALL         <- tolower(Sys.getenv("IMPORT_ALL","false"))        %in% c("1","true","yes"))
+RUN_SMOKE_TEST     <- tolower(Sys.getenv("RUN_SMOKE_TEST","false"))    %in% c("1","true","yes"))
 
 CHUNK_SIZE         <- as.integer(Sys.getenv("CHUNK_SIZE","800"))
 CHUNK_OFFSET       <- as.integer(Sys.getenv("CHUNK_OFFSET","0"))
 USERNAME_FILTER    <- Sys.getenv("USERNAME_FILTER","")                 # e.g. "HyMatrixOrg"
 ORDER_DIR          <- toupper(Sys.getenv("ORDER_DIR","DESC"))          # display order
 if (!(ORDER_DIR %in% c("ASC","DESC"))) ORDER_DIR <- "DESC"
+
+# --- mode & priority list ----------------------------------------------------
+SYNC_MODE <- tolower(Sys.getenv("SYNC_MODE", "all"))
+PRIORITY_USERNAMES <- Sys.getenv("PRIORITY_USERNAMES", "")  # CSV e.g. "HyMatrixOrg,outprog,EverVisionLabs"
+parse_csv <- function(x) {
+  x <- trimws(x)
+  if (!nzchar(x)) return(character())
+  unique(sub("^@", "", trimws(unlist(strsplit(x, ",")))))
+}
+priority_vec <- parse_csv(PRIORITY_USERNAMES)
+
+message(sprintf("SYNC_MODE=%s; priority_n=%d; USERNAME_FILTER=%s",
+                SYNC_MODE, length(priority_vec),
+                ifelse(nzchar(USERNAME_FILTER), USERNAME_FILTER, "<none>")))
 
 # Resumability budgets (stop early; workflow will auto-continue)
 MAX_ROWS_PER_RUN   <- as.integer(Sys.getenv("MAX_ROWS_PER_RUN","1200"))
@@ -339,9 +357,27 @@ con <- DBI::dbConnect(
 since <- as.POSIXct(Sys.time(), tz = "UTC") - LOOKBACK_HOURS * 3600
 since_str <- format(since, "%Y-%m-%d %H:%M:%S%z")
 
-# Base WHERE (lookback or ALL) + optional username filter
-base_where  <- if (IMPORT_ALL) "TRUE" else paste0("date >= TIMESTAMPTZ ", DBI::dbQuoteString(con, since_str))
-user_clause <- if (nzchar(USERNAME_FILTER)) paste0(" AND username = ", DBI::dbQuoteString(con, USERNAME_FILTER)) else ""
+# Base WHERE (lookback or ALL)
+base_where <- if (IMPORT_ALL) {
+  "TRUE"
+} else {
+  paste0("date >= TIMESTAMPTZ ", DBI::dbQuoteString(con, since_str))
+}
+
+# Username constraints:
+# - If USERNAME_FILTER is set (manual filter), it takes precedence.
+# - Else, if SYNC_MODE=priority, filter to PRIORITY_USERNAMES.
+user_clause <- ""
+if (nzchar(USERNAME_FILTER)) {
+  user_clause <- paste0(" AND username = ", DBI::dbQuoteString(con, USERNAME_FILTER))
+} else if (SYNC_MODE == "priority") {
+  if (!length(priority_vec)) {
+    DBI::dbDisconnect(con)
+    stop("SYNC_MODE=priority but PRIORITY_USERNAMES is empty. Set repo var TW_PRIORITY_HANDLES / env PRIORITY_USERNAMES.")
+  }
+  qs <- paste(vapply(priority_vec, DBI::dbQuoteString, con = con, FUN.VALUE = character(1)), collapse = ",")
+  user_clause <- paste0(" AND username IN (", qs, ")")
+}
 
 # Expected DISTINCT tweets under this filter (by stable key)
 exp_sql <- sprintf("
@@ -404,7 +440,7 @@ if (INSPECT_FIRST_ROW) {
   one <- DBI::dbGetQuery(con, test_q)
   if (nrow(one)) {
     one$date <- parse_dt(one$date)
-    # explain_props(one[1, , drop = FALSE])  # optional: uncomment if you have it
+    # explain_props(one[1, , drop = FALSE])  # optional: keep commented
   }
 }
 
@@ -491,4 +527,3 @@ message(sprintf("All pages done. Upserts ok: %d. Expected distinct under filter:
 # Tell the workflow we’re finished
 go <- Sys.getenv("GITHUB_OUTPUT")
 if (nzchar(go)) write("next_offset=done", file = go, append = TRUE)
-
