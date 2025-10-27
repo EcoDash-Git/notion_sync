@@ -1,9 +1,9 @@
 name: Sync Supabase → Notion
 
 on:
-  # Run every 5 minutes; gate decides if we actually sync.
+  # Run every 15 minutes; gate decides if we actually sync.
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       sync_mode:
