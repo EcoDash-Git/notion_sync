@@ -1,7 +1,7 @@
 name: Sync Supabase → Notion
 
 on:
-  # Run frequently; a cheap gate will allow only the desired times.
+  # Run every 5 minutes; gate decides if we actually sync.
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
@@ -55,25 +55,28 @@ jobs:
     steps:
       - id: pick
         run: |
-          # Europe/Paris covers CET/CEST correctly.
+          # Paris time (handles CET/CEST)
           HOUR=$(TZ=Europe/Paris date +%H)
           MIN=$(TZ=Europe/Paris date +%M)
+          echo "Paris now → ${HOUR}:${MIN}"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Gate decision → manual"
             echo "run_mode=manual" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Allow only at 05:00 (ALL) and 14:00 (PRIORITY)
-          if [ "$HOUR" = "05" ] && [ "$MIN" = "00" ]; then
-            echo "run_mode=all" >> "$GITHUB_OUTPUT"
-          elif [ "$HOUR" = "14" ] && [ "$MIN" = "00" ]; then
-            echo "run_mode=priority" >> "$GITHUB_OUTPUT"
+          # allow the first 10 minutes of the target hour
+          if [ "$HOUR" = "05" ] && [ "$MIN" -ge 0 ] && [ "$MIN" -lt 10 ]; then
+            MODE="all"
+          elif [ "$HOUR" = "14" ] && [ "$MIN" -ge 0 ] && [ "$MIN" -lt 10 ]; then
+            MODE="priority"
           else
-            echo "run_mode=none" >> "$GITHUB_OUTPUT"
+            MODE="none"
           fi
 
-          echo "Europe/Paris time: $HOUR:$MIN → ${{ steps.pick.outputs.run_mode }}"
+          echo "Gate decision → ${MODE}"
+          echo "run_mode=${MODE}" >> "$GITHUB_OUTPUT"
 
   sync:
     needs: gate
@@ -179,7 +182,9 @@ jobs:
           PRIORITY_USERNAMES:  ${{ vars.TW_PRIORITY_HANDLES }}   # e.g. "HyMatrixOrg,outprog,EverVisionLabs"
           USERNAME_FILTER:     ${{ inputs.username_filter || '' }}
           IMPORT_ALL:          ${{ inputs.import_all      || 'false' }}
-        run: Rscript sync_notion.R
+        run: |
+          echo "SYNC_MODE=${SYNC_MODE}"
+          Rscript sync_notion.R
 
       - name: Auto-continue next chunk
         if: ${{ steps.run.outputs.next_offset && steps.run.outputs.next_offset != 'done' }}
